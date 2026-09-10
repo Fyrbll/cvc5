@@ -3,11 +3,13 @@
 #ifndef CVC5__THEORY__QUANTIFIERS__ENUMERATIVE_CONJECTURE_GENERATOR_H
 #define CVC5__THEORY__QUANTIFIERS__ENUMERATIVE_CONJECTURE_GENERATOR_H
 
+#include "expr/e_match.h"
 #include "expr/sygus_term_enumerator.h"
 #include "expr/term_canonize.h"
 #include "smt/env_obj.h"
 #include "theory/quantifiers/quant_module.h"
 #include "theory/quantifiers/sygus/sygus_enumerator.h"
+#include "theory/smt_engine_subsolver.h"
 
 namespace cvc5::internal {
 namespace theory {
@@ -34,7 +36,35 @@ class Candidate
             const size_t confirmed);
 };
 
+/**
+ * There is a natural number 'n' such that, for each natural number 'i' less
+ * than n, candidateIndex[i] is a priority queue of candidate conjectures where
+ * the highest-priority candidate is at the top.  Candidate 'c1' is prioritized
+ * over candidate 'c0' if -- but not only if -- c1.d_confirmed > c0.d_confirmed.
+ */
 typedef std::vector<std::priority_queue<Candidate>> CandidateIndex;
+
+class EcgCandidateCallback : public CandidateCallback
+{
+ public:
+  TermDb *d_termDatabase;
+  bool d_preferActiveTerms;
+
+  EcgCandidateCallback(
+    TermDb *termDatabase,
+    const bool preferActiveTerms) :
+    CandidateCallback(),
+    d_termDatabase(termDatabase),
+    d_preferActiveTerms(preferActiveTerms)
+  {}
+
+  bool consider(TNode candidate) override
+  {
+    return
+      (!d_preferActiveTerms ||
+       d_termDatabase->isTermActive(candidate));
+  }
+};
 
 class EnumerativeConjectureGenerator : public QuantifiersModule
 {
@@ -155,9 +185,38 @@ class EnumerativeConjectureGenerator : public QuantifiersModule
   size_t d_period;
   bool d_preferConstRepresentatives;
   bool d_preferActiveTerms;
+  bool d_subsolverEMatchFilter;
   Options d_defaultOptions;
   Set<TNode> d_conjectures;
   bool d_split;  
+
+  /**
+   * Use the variable below if ecgSubsolverEMatchFilter is true.  Initialize it
+   * with the initial facts when you set d_initialFacts in check().  Ensure that
+   * the following options are turned OFF:
+   *
+   * - quantInduction
+   * - dtStcInduction
+   * - conjectureGen
+   * - enumerativeConjectureGenerator
+   * - conflictBasedInst
+   * - quantSubCbqi
+   *
+   * Ensure the following options are turned ON.
+   *
+   * - contextualEnumerator
+   * - instMaxRounds with the value 10
+   */
+  std::unique_ptr<SolverEngine> d_filteringSubsolver;
+
+  /**
+   * Use the variable below to store a pointer to the e-matching callback.  The
+   * managed object is ideally constructed once, during the first call to
+   * check().  A pointer to the managed object is passed to
+   * findSubstitutionsPreferred().  The purpose of the callback ought to be
+   * clear from its implementation.
+   */
+  std::unique_ptr<EcgCandidateCallback> d_ecgCandidateCallback;
 
   // Functions, non-static
 
@@ -169,11 +228,9 @@ class EnumerativeConjectureGenerator : public QuantifiersModule
    */
   std::vector<std::vector<Node>> oldFindCompatible(TNode lhs);
 
-  // Functions, static
+  void debugPrintFacts(std::ostream& out, const Set<TNode>& facts);
 
-  static void debugPrintFacts(std::ostream& out, const Set<TNode>& facts);
-
-  static std::vector<std::vector<Node>> findCompatible(
+  std::vector<std::vector<Node>> findCompatible(
       const size_t maximumSize,
       const size_t maximumDifference,
       const Map<Node, Index>& variableToIndex,
@@ -181,9 +238,42 @@ class EnumerativeConjectureGenerator : public QuantifiersModule
       const Map<TypeNode, std::uint8_t>& typeToNumber,
       TNode canonical);
 
+  /**
+   * The following function returns a vector of substitutions such that for each
+   * substitution 'sigma' in the result the image of 'canonical' under 'sigma'
+   * is represented in the equality engine.  When we say that the image is
+   * represented in the equality engine we mean that it may not literally be in
+   * the equality engine and the equalities stored in the equality engine entail
+   * that the image is equivalent to a term that is in the equality engine.  See
+   * _Definition 6_ in _Relational E-matching_ by Zhang et al. 2022.
+   *
+   * 'canonical' represents the left-hand side of some future candidate
+   * conjecture but in this context we simply accept it as a pattern for
+   * e-matching. I feel the remaining arguments do not warrant an explanation
+   * right now.
+   *
+   * The following function is the _preferred_ implementation of
+   * findSubstitutions because it uses the e-matching implementation from
+   * ../../expr/e_match.cpp which is _more sound_ and _more complete_ than the
+   * implementation in ./enumerative_conjecture_generator.cpp.  The former means
+   * that I am more confident that for each substitution 'sigma' in the result
+   * vector the term sigma.apply(canonical) is represented in equalityEngine.
+   * The latter means that the e-matching implementation is also more likely to
+   * discover such substitutions.  However the e-matching implementation is
+   * still _incomplete_.  It is not guaranteed to find all substitutions 'sigma'
+   * such that sigma.apply(canonical) is represented in equalityEngine.
+   */
+  std::vector<Subs> findSubstitutionsPreferred(
+    TermDb *termDatabase,
+    eq::EqualityEngine *equalityEngine,
+    TNode canonical,
+    const bool preferConstRepresentatives,
+    const bool preferActiveTerms,
+    const std::int64_t substitutionLimit);
+
   /** Returns a vector of substitutions such that the image of 'canonical' under
    * each substitution is a member of some known equivalence class. */
-  static std::vector<Subs> findSubstitutions(
+  std::vector<Subs> findSubstitutions(
       TermDb* termDatabase,
       eq::EqualityEngine* equalityEngine,
       TNode canonical,
@@ -235,53 +325,67 @@ class EnumerativeConjectureGenerator : public QuantifiersModule
     return m.find(k) != m.end();
   }
 
-  static void addTerm(expr::TermCanonize& termCanonize,
+  /**
+   * This is an important note about the implementation of addTerm.  Observe
+   * that rootVariableToIndex is an instance of Map<Node, Index> while on the
+   * other hand the d_variableToIndex field in the Index class is an instance of
+   * Map<Node, Index*>.  This means that for any 'v' that is an instance of
+   * Node, rootVariableToIndex[v] is a safe operation in the sense that if
+   * rootVariableToIndex does not associate v with an Index then one will be
+   * created automatically.  However suppose 'index' represents a pointer to
+   * rootVariableToIndex[v].  index->d_variableToIndex[v] is an unsafe
+   * operation.  It will likely cause a segfault if d_variableToIndex does not
+   * already associate v with an Index*.  This is why we set
+   * index->d_variableToIndex[v] to 'new Index()' if index->d_variableToIndex
+   * does not have v as a key already.
+   */
+  void addTerm(expr::TermCanonize& termCanonize,
                       const Map<TypeNode, std::uint8_t>& typeToNumber,
                       const Node term,
-                      Map<Node, Index>& variableToIndex);
+                      Map<Node, Index>& rootVariableToIndex);
 
-  static void debugPrintIndex(
+  void debugPrintIndex(
       std::ostream& out,
       const std::unordered_map<Node, Index>& rootVariableToIndex);
 
-  static void debugPrintSizeToCanonicals(
+  void debugPrintSizeToCanonicals(
       std::ostream& out,
       const size_t maximumSize,
       const std::vector<std::unordered_set<Node>>& sizeToCanonicals);
 
-  static void updateClock(size_t& clock, const size_t period);
+  void updateClock(size_t& clock, const size_t period);
 
-  static std::vector<Node> getRelevantFunctionSymbols(TermDb* termDatabase);
+  std::vector<Node> getRelevantFunctionSymbols(TermDb* termDatabase);
 
-  static void updateSymbolToKind(TermDb* termDatabase,
+  void updateSymbolToKind(TermDb* termDatabase,
                                  const std::vector<Node>& functionSymbols,
                                  std::unordered_map<Node, Kind>& symbolToKind);
 
-  static std::vector<TypeNode> getRelevantTypes(
+   std::vector<TypeNode> getRelevantTypes(
       const std::vector<Node>& functionSymbols);
 
-  static void updateTypeToIn(NodeManager* nodeManager,
+   void updateTypeToIn(NodeManager* nodeManager,
                              const std::vector<TypeNode>& types,
                              const TypeNode rootType,
                              std::unordered_map<TypeNode, Node>& typeToIn);
 
-  static void updateTypeToNonTerminal(
+   void updateTypeToNonTerminal(
       const std::vector<TypeNode>& types,
       std::unordered_map<TypeNode, Node>& typeToNonTerminal);
 
-  static void updateTypeToVariables(
+   void updateTypeToVariables(
       const std::vector<TypeNode>& types,
       expr::TermCanonize& termCanonize,
       const size_t maximumSize,
       const size_t varsPerType,
       std::unordered_map<TypeNode, std::vector<Node>>& typeToVariables);
 
-  static std::vector<Node> getNonTerminals(
+   std::vector<Node> getNonTerminals(
       const TNode rootNonTerminal,
       const std::vector<TypeNode>& types,
       const std::unordered_map<TypeNode, Node>& typeToNonTerminal);
 
-  static TypeNode getGrammarType(
+   TypeNode getGrammarType(
       NodeManager* nodeManagerPtr,
       const TNode rootNonTerminal,
       const std::vector<Node>& functionSymbols,
@@ -291,47 +395,62 @@ class EnumerativeConjectureGenerator : public QuantifiersModule
       const std::unordered_map<TypeNode, Node>& typeToIn,
       const std::unordered_map<TypeNode, std::vector<Node>>& typeToVariables);
 
-  static std::vector<std::pair<Node, Node>> getInjectorRules(
+   std::vector<std::pair<Node, Node>> getInjectorRules(
       NodeManager* nodeManagerPtr,
       const TNode rootNonTerminal,
       const std::vector<TypeNode>& types,
       const std::unordered_map<TypeNode, Node>& typeToNonTerminal,
       const std::unordered_map<TypeNode, Node>& typeToIn);
 
-  static std::vector<std::pair<Node, Node>> getFunctionRules(
+   std::vector<std::pair<Node, Node>> getFunctionRules(
       NodeManager* nodeManagerPtr,
       const std::vector<Node>& functionSymbols,
       const std::unordered_map<Node, Kind>& symbolToKind,
       const std::unordered_map<TypeNode, Node>& typeToNonTerminal);
 
-  static std::vector<std::pair<Node, Node>> getVariableRules(
+   std::vector<std::pair<Node, Node>> getVariableRules(
       const std::vector<TypeNode>& types,
       const std::unordered_map<TypeNode, Node>& typeToNonTerminals,
       const std::unordered_map<TypeNode, std::vector<Node>> typeToVariables);
 
-  static std::pair<std::vector<std::unordered_set<Node>>,
+   std::pair<std::vector<std::unordered_set<Node>>,
                    std::unordered_map<Node, Index>>
   getEnumerationData(SygusTermEnumerator& termEnumerator,
                      expr::TermCanonize& termCanonize,
                      const Map<TypeNode, std::uint8_t>& typeToNumber,
                      const size_t maximumSize);
 
-  static size_t computeSize(TNode n);
+   size_t computeSize(TNode n);
 
-  static size_t underestimateSize(TNode n);
+   size_t underestimateSize(TNode n);
 
-  static TypeNode findTypeByName(const std::string& name,
+   TypeNode findTypeByName(const std::string& name,
                                  const std::vector<TypeNode>& types);
 
-  static Node findFunctionSymbolByName(const std::string& name,
+   Node findFunctionSymbolByName(const std::string& name,
                                        const std::vector<Node>& symbols);
 
-  static void debugPrintLHSToSubstitutions(
+   void debugPrintLHSToSubstitutions(
       std::ostream& out,
       const Vector<Set<Node>>& sizeToCanonicals,
       const Map<Node, Vector<Subs>>& canonicalToSubstitutions);
 
-  static std::unordered_map<Node, std::vector<Subs>>
+   /**
+    * If the quantifiers option 'ecgSubsolverEMatchFilter' is _false_ then this
+    * function maps each LHS pattern in 'sizeToCanonicals' to its image under
+    * 'findSubstitutionsPreferred'.  If the same option is true then this
+    * function returns an empty map because the subsolver will compute the
+    * substitutions instead of the main solver.
+    *
+    * Let us return to the first sentence in the above paragraph.  Recall that
+    * for each canonical (term) in sizeToCanonicals the term's head symbol is an
+    * injector, a function symbol that carries the actual LHS pattern into the
+    * type of the grammar's root non-terminal symbol.  We remove the injector
+    * from each term before associating it with a collection of substitutions in
+    * getCanonicalToSubstitutions.  To say it once again: none of the keys in
+    * getCanonicalToSubstitutions mentions an injector.
+    */
+   std::unordered_map<Node, std::vector<Subs>>
   getCanonicalToSubstitutions(
       TermDb* termDatabase,
       eq::EqualityEngine* equalityEngine,
@@ -340,21 +459,78 @@ class EnumerativeConjectureGenerator : public QuantifiersModule
       const bool preferActiveTerms,
       const std::int64_t substitutionLimit);
 
-  static CandidateIndex getCandidateIndex(
+   /** 
+    * Implementation note 1: The terms in szToCanons all have an injector
+    * function symbol as their head function symbol.  In constrast to this none
+    * of the keys in lhsToSubss mention an injector function symbol.  This means
+    * that if 't' is a term from szToCanons then the substitutions under which t
+    * is represented in the equality engine can be obtained with
+    * lhsToSubss.at(t[0]).
+    *
+    * Implementation note 2: This function should behave differently depending
+    * on the value of d_subsolverEMatchFilter.  If d_subsolverEMatchFilter is
+    * true then we expect the dictionary lhsToSubss to be _empty_ since we will
+    * rely on d_filteringSubsolver to compute substitutions.  On the other hand
+    * if d_subsolverEmatchFilter is false then we expect that
+    * lhsToSubss.at(t[0]) will succeed for any term 't' from szToCanons.  To
+    * reiterate we expect that all calls to 'at()' can be unguarded when
+    * d_subsolverEMatchFilter is _false_.
+    */
+   CandidateIndex getCandidateIndex(
       const size_t maximumSize,
       const size_t maximumDifference,
       expr::TermCanonize& termCanonize,
       EntailmentCheck* entailmentCheck,
       eq::EqualityEngine* equalityEngine,
-      const Vector<Set<Node>>& sizeToCanonicals,
+      const Vector<Set<Node>>& szToCanons,
       const Map<Node, Index>& variableToIndex,
       const Map<TypeNode, std::uint8_t>& typeToNumber,
-      const Map<Node, Vector<Subs>>& canonicalToSubstitutions,
+      const Map<Node, Vector<Subs>>& lhsToSubss,
       NodeManager* nodeMgr,
       const Set<Node>& dedEnt,
       const Set<Node>& indEnt);
 
-  static std::pair<size_t, size_t> getScore(
+   /**
+    * We take the following steps to assign a score to 'conjecture'.  Remember
+    * that a score is a pair whose first component is _nominally_ the number of
+    * substitutions tested and whose second component is the number of
+    * substitutions under which the LHS and RHS are entailed to be equivalent.
+    * We iterate over all the substitutions in 'subss', which are all grounding
+    * substitutions.  For each substitution 'sigma' we apply sigma to the LHS
+    * and RHS of the conjecture.  We then handle 5 possibilities.
+    *
+    * 1. Either one of sigma(LHS) or sigma(RHS) is not represented in the
+    * congruence closure (as determined by an incomplete procedure).  In this
+    * case we do not bump 'tested' or 'confirmed'.
+    *
+    * 2. sigma(LHS) and sigma(RHS) are represented in the congruence closure and
+    * live in the same equivalence class.  Here we bump both tested and
+    * confirmed.
+    *
+    * 3. sigma(LHS) and sigma(RHS) are represented in the c.c., live in
+    * different equivalence classes, and both equivalence class representatives
+    * are ground constructor terms.  If we trust the current partial model for
+    * our recursive functions then sigma(LHS) and sigma(RHS) cannot possibly be
+    * equivalent.  We bump tested but do not bump confirmed.  Any conjecture
+    * where confirmed < tested will be discarded later.
+    *
+    * 4. sigma(LHS) and sigma(RHS) are represented in the c.c., live in
+    * different equivalence classes, the representatives are not ground
+    * constructor terms, but the solver says they are forced to be disequal.  We
+    * handle this case the same as case #3.  5. Otherwise we leave both tested
+    * and confirmed unchanged.
+    */
+   std::pair<size_t, size_t> getScoreMainSolver(
+     TNode conjecture,
+     const Vector<Subs>& subss,
+     EntailmentCheck* entChk,
+     const eq::EqualityEngine* ee);
+
+   std::pair<size_t, size_t> getScoreSubsolver(
+     TNode conjecture,
+     SolverEngine *filteringSubsolver);
+
+   std::pair<size_t, size_t> getScore(
       EntailmentCheck* entailmentCheck,
       const eq::EqualityEngine* equalityEngine,
       TNode canonical,
@@ -364,32 +540,32 @@ class EnumerativeConjectureGenerator : public QuantifiersModule
       const Set<Node>& dedEnt,
       const Set<Node>& indEnt);
 
-  static Vector<Node> getSortedVariables(
+   Vector<Node> getSortedVariables(
       const expr::TermCanonize& termCanonize,
       const Map<TypeNode, std::uint8_t>& typeToNumber,
       TNode term);
 
-  static bool variableLessThan(const expr::TermCanonize& termCanonize,
+   bool variableLessThan(const expr::TermCanonize& termCanonize,
                                const Map<TypeNode, std::uint8_t>& typeToNumber,
                                TNode n0,
                                TNode n1);
 
-  static void debugPrintSizeToCompatibles(
+   void debugPrintSizeToCompatibles(
       std::ostream& out,
       TNode canonical,
       const Vector<Vector<Node>>& szToCompats);
 
-  static bool isSymbolRelevant(const TermDb* termDb, const size_t i);
+   bool isSymbolRelevant(const TermDb* termDb, const size_t i);
 
-  static void debugPrintCandidateIndex(
+   void debugPrintCandidateIndex(
       std::ostream& out, const Vector<PriorityQueue<Candidate>>& candIdx);
 
-  static bool areSame(const Vector<Node>& v, const Vector<Node>& w);
+   bool areSame(const Vector<Node>& v, const Vector<Node>& w);
 
-  static void updateTypeToNumber(const Vector<TypeNode>& types,
+   void updateTypeToNumber(const Vector<TypeNode>& types,
                                  Map<TypeNode, std::uint8_t>& typeToNum);
 
-  static void filterCandidates(
+   void filterCandidates(
       Env& env,
       Options& subsolverOpts,
       quantifiers::QuantifiersInferenceManager& quantInfMgr,
@@ -405,7 +581,7 @@ class EnumerativeConjectureGenerator : public QuantifiersModule
       const quantifiers::QuantifiersState& quantifiersState,
       const bool split);
 
-  static bool filterConjecture(Env& env,
+   bool filterConjecture(Env& env,
                                Options& subsolverOpts,
                                quantifiers::TermRegistry& termReg,
                                Set<Node>& indEnt,
@@ -420,14 +596,14 @@ class EnumerativeConjectureGenerator : public QuantifiersModule
                                const quantifiers::QuantifiersState& quantifiersState,
                                const bool split);
 
-  static void assertConjecture(
+   void assertConjecture(
       quantifiers::QuantifiersInferenceManager& quantInfMgr, TNode conj, const bool split, const Vector<Node>& indEntBuf);
 
-  static Node candidateToConjecture(NodeManager* nodeMgr,
+   Node candidateToConjecture(NodeManager* nodeMgr,
                                     const Candidate& cand,
                                     theory::Rewriter* rewriter);
 
-  static bool isEntailed(Env& env,
+   bool isEntailed(Env& env,
                          Options& subsolverOpts,
                          quantifiers::TermRegistry& termReg,
                          const Vector<Node>& extra,
@@ -436,14 +612,26 @@ class EnumerativeConjectureGenerator : public QuantifiersModule
                          const Set<TNode>& initialFacts,
                          TNode conj);
 
-  static void debugPrintAssertions(std::ostream& out,
+   void debugPrintAssertions(std::ostream& out,
                                    const Vector<Node>& assertions);
 
-  static void debugPrintFilterConjecture(std::ostream& out, TNode conj, FilterResult result);
+   void debugPrintFilterConjecture(std::ostream& out, TNode conj, FilterResult result);
 
-  static Set<TNode> getProvedConjectures(const Set<TNode>& conjectures, const Valuation& valuation, const quantifiers::TermRegistry& termReg);
+   Set<TNode> getProvedConjectures(const Set<TNode>& conjectures, const Valuation& valuation, const quantifiers::TermRegistry& termReg);
 
-  static Set<TNode> getInitialFacts(Valuation& valuation, quantifiers::TermRegistry& termReg);
+   /**
+    * Observe that there are two different member functions with the name
+    * getInitialFacts.  The older function uses a valuation and a term registry
+    * to retrieve all assertions, both quantified and quantifier-free, that are
+    * fixed (i.e. decision level zero) SAT literals.  It is the *dispreferred*
+    * implementation of getInitialFacts.  The newer implementation simply
+    * accepts a vector of assertions.  We mean to feed it the vector of all
+    * preprocessed assertions from the input file.  In some sense the newer
+    * implementation is preferred because it is a more faithful reflection of
+    * the initial assertions.
+    */
+   Set<TNode> getInitialFacts(const Vector<Node>& assertions);
+   Set<TNode> getInitialFacts(Valuation& valuation, quantifiers::TermRegistry& termReg);
 };
 
 class Decision;
